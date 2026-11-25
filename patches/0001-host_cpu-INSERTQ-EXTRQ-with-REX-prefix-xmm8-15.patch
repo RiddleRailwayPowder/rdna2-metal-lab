@@ -1,0 +1,225 @@
+From 405f13dd9da6280aff816ac7e70118e8e1b9716d Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Tue, 24 Nov 2026 16:36:41 +0000
+Subject: [PATCH] host_cpu: INSERTQ/EXTRQ with REX prefix (xmm8-15)
+
+The SSE4a stubs refused the REX-prefixed forms, so an INSERTQ or EXTRQ on xmm8-15
+still ended a run with an illegal instruction on hosts without SSE4a (Intel, Rosetta).
+REX.R and REX.B now extend ModRM.reg and ModRM.rm; stub_for reports the 7-byte length.
+EXTRQ with REX.R stays refused (/0).
+
+Tests: 612 INSERTQ/EXTRQ results (was 288) with REX.R, REX.B and both; on Windows the
+test functions keep the nonvolatile xmm6-15 they use. Checked under Rosetta 2 (M1 Pro).
+
+---
+ docs/startup-runtime.md         |  6 ++---
+ tests/startup_host_cpu_check.py | 45 ++++++++++++++++++++++++++-------
+ tools/startup/host_cpu.py       | 45 +++++++++++++++++++++++----------
+ 3 files changed, 70 insertions(+), 26 deletions(-)
+
+diff --git a/docs/startup-runtime.md b/docs/startup-runtime.md
+index a83fda9..dc04b1f 100644
+--- a/docs/startup-runtime.md
++++ b/docs/startup-runtime.md
+@@ -670,7 +670,7 @@ debugger round trip.
+ | `CLWB m8` | `CLFLUSHOPT m8` (one ModRM bit); one `NOP` of the same length once a `CLFLUSHOPT` has faulted on this host |
+ | `MONITORX`, `MWAITX` | a 3-byte `NOP`; `PAUSE` and `NOP` (the wait may end at any time) |
+ | `CLZERO` | a jump to a stub that stores 64 zero bytes at `rax & ~63` |
+-| `INSERTQ xmm, xmm, len, idx`, `EXTRQ xmm, len, idx` (xmm0-7) | a jump to a stub that does the field move in integer registers |
++| `INSERTQ xmm, xmm, len, idx`, `EXTRQ xmm, len, idx` (xmm0-15) | a jump to a stub that does the field move in integer registers |
+ | `MOVNTSS m32, xmm`, `MOVNTSD m64, xmm` | `MOVSS`, `MOVSD` stores (one opcode byte; the non-temporal hint is dropped) |
+ | `RDPRU` | `RDTSC`; `NOP` (the time-stamp counter stands in for MPERF and APERF, so their ratio reads 1) |
+ | `RDPID r64` | a jump to a stub that runs `RDTSCP` and moves its `ecx` to the register |
+@@ -679,10 +679,10 @@ debugger round trip.
+ The stubs keep the other registers and the flags. Instructions that the 5-byte jump overwrites
+ are re-encoded behind the stub with iced-x86. `events.txt` names the first 40 rewritten sites and
+ the summary counts them by instruction. `tools/startup/host_cpu.py` lists the forms that are
+-refused (register-count `INSERTQ`/`EXTRQ`, xmm8-15, fields past bit 63).
++refused (register-count `INSERTQ`/`EXTRQ`, fields past bit 63).
+ 
+ `python -B tests/startup_host_cpu_check.py` assembles source-built functions, patches them the same
+-way and calls them on the host: 288 `INSERTQ`/`EXTRQ` results against a model, `CLZERO` with a
++way and calls them on the host: 612 `INSERTQ`/`EXTRQ` results against a model, `CLZERO` with a
+ moved `lea` and a moved rip-relative load and decoded `CLWB` and wait rewrites, including the
+ `NOP` form for every addressing mode. The fall-back from `CLFLUSHOPT` to `NOP` in the debugger is
+ not exercised here: it needs a host without `CLFLUSHOPT`. Stubs that zero 56
+diff --git a/tests/startup_host_cpu_check.py b/tests/startup_host_cpu_check.py
+index 23c10a0..e517aa3 100644
+--- a/tests/startup_host_cpu_check.py
++++ b/tests/startup_host_cpu_check.py
+@@ -123,11 +123,30 @@ def clzero_moves_rip_relative():
+ 
+ # ---- INSERTQ / EXTRQ ----------------------------------------------------------------------------
+ def movq_to_xmm(xmm, gpr):   # movq xmm, r64
+-    return bytes([0x66, 0x48, 0x0F, 0x6E, 0xC0 | xmm << 3 | gpr])
++    return bytes([0x66, 0x4C if xmm & 8 else 0x48, 0x0F, 0x6E, 0xC0 | (xmm & 7) << 3 | gpr])
+ 
+ 
+ def movq_from_xmm(xmm):      # movq rax, xmm
+-    return bytes([0x66, 0x48, 0x0F, 0x7E, 0xC0 | xmm << 3])
++    return bytes([0x66, 0x4C if xmm & 8 else 0x48, 0x0F, 0x7E, 0xC0 | (xmm & 7) << 3])
++
++
++def keep_xmm(*xmms):
++    """(save, restore) code for the Windows nonvolatile registers among xmms (xmm6-15), on the stack."""
++    kept = sorted({x for x in xmms if WINDOWS and x >= 6})
++    if not kept:
++        return b"", b""
++    size = 16 * len(kept) + 8   # keeps rsp 16-byte aligned after the return address
++    def move(opcode, x, slot):  # movdqu [rsp + slot], xmm (7F) / movdqu xmm, [rsp + slot] (6F)
++        return b"\xf3" + (b"\x44" if x & 8 else b"") + bytes([0x0F, opcode, 0x44 | (x & 7) << 3, 0x24, slot])
++    save = bytes([0x48, 0x83, 0xEC, size]) + b"".join(move(0x7F, x, 16 * i) for i, x in enumerate(kept))
++    restore = b"".join(move(0x6F, x, 16 * i) for i, x in enumerate(kept)) + bytes([0x48, 0x83, 0xC4, size])
++    return save, restore
++
++
++def sse4a_prefix(prefix, reg, rm):
++    """The SSE4a prefix, plus a REX byte when reg or rm is xmm8-15."""
++    rex = (4 if reg & 8 else 0) | (1 if rm & 8 else 0)
++    return bytes([prefix, 0x40 | rex]) if rex else bytes([prefix])
+ 
+ 
+ def insertq_model(a, b, width, offset):
+@@ -140,13 +159,16 @@ def extrq_model(a, width, offset):
+ 
+ 
+ def insertq_function(dest, src, width, offset, patch=True, stub=None):
+-    instruction = bytes([0xF2, 0x0F, 0x78, 0xC0 | dest << 3 | src, width, offset])
+-    return build(movq_to_xmm(dest, 1) + movq_to_xmm(src, 2), instruction, movq_from_xmm(dest) + b"\xc3", stub, patch)
++    instruction = sse4a_prefix(0xF2, dest, src) + bytes([0x0F, 0x78, 0xC0 | (dest & 7) << 3 | src & 7, width, offset])
++    save, restore = keep_xmm(dest, src)
++    return build(save + movq_to_xmm(dest, 1) + movq_to_xmm(src, 2), instruction,
++                 movq_from_xmm(dest) + restore + b"\xc3", stub, patch)
+ 
+ 
+ def extrq_function(dest, width, offset, patch=True):
+-    instruction = bytes([0x66, 0x0F, 0x78, 0xC0 | dest, width, offset])
+-    return build(movq_to_xmm(dest, 1), instruction, movq_from_xmm(dest) + b"\xc3", None, patch)
++    instruction = sse4a_prefix(0x66, 0, dest) + bytes([0x0F, 0x78, 0xC0 | dest & 7, width, offset])
++    save, restore = keep_xmm(dest)
++    return build(save + movq_to_xmm(dest, 1), instruction, movq_from_xmm(dest) + restore + b"\xc3", None, patch)
+ 
+ 
+ VALUES = [(0x0123456789ABCDEF, 0xFEDCBA9876543210), (M64, 0), (0, M64), (0x8000000000000001, 0x5555AAAA5555AAAA)]
+@@ -155,7 +177,8 @@ FIELDS = [(16, 16), (1, 0), (1, 63), (8, 56), (63, 1), (32, 0), (0, 0), (5, 11),
+ 
+ def sse4a_cases(native):
+     checked = 0
+-    for dest, src in ((0, 1), (1, 0), (3, 7), (7, 2), (5, 5)):
++    for dest, src in ((0, 1), (1, 0), (3, 7), (7, 2), (5, 5),
++                      (9, 7), (8, 0), (0, 15), (11, 12), (14, 13), (15, 15)):   # REX.R, REX.B, both
+         for width, offset in FIELDS:
+             patched = insertq_function(dest, src, width, offset)
+             original = insertq_function(dest, src, width, offset, patch=False) if native else None
+@@ -168,7 +191,7 @@ def sse4a_cases(native):
+                 if original:
+                     assert original(a, b) == expected, f"native insertq differs from the model ({width}, {offset})"
+                 checked += 1
+-    for dest in (0, 4, 7):
++    for dest in (0, 4, 7, 8, 12, 15):
+         for width, offset in FIELDS:
+             patched = extrq_function(dest, width, offset)
+             original = extrq_function(dest, width, offset, patch=False) if native else None
+@@ -243,10 +266,14 @@ def rewrites():
+ 
+     # Encodings the stubs do not cover are refused, not approximated.
+     assert host_cpu.sse4a_stub(bytes.fromhex("f20f78c12020")) is not None  # 32 bits at 32 is defined
++    # With a REX prefix the instruction is 7 bytes long.
++    assert host_cpu.stub_for(bytes.fromhex("f2440f78cf0800"))[0] == 7
++    assert host_cpu.stub_for(bytes.fromhex("f20f78c11010"))[0] == 6
+     for refused in (bytes.fromhex("f20f78c13030"),               # idx + len > 64
+                     bytes.fromhex("f20f78011010"),               # not a register operand
+                     bytes.fromhex("660f78c81010"),               # extrq with /1
+-                    bytes.fromhex("f2410f78c110"),               # REX prefix (xmm8-15)
++                    bytes.fromhex("66440f78c01010"),             # extrq with REX.R: /0 extended to 8
++                    bytes.fromhex("f2410f78c130"),               # REX form cut short (no second immediate)
+                     bytes.fromhex("f20f79c1c3c3")):              # register-count form
+         assert host_cpu.sse4a_stub(refused) is None and host_cpu.stub_for(refused) is None, refused.hex()
+ 
+diff --git a/tools/startup/host_cpu.py b/tools/startup/host_cpu.py
+index 54d73d7..006b3e8 100644
+--- a/tools/startup/host_cpu.py
++++ b/tools/startup/host_cpu.py
+@@ -23,7 +23,7 @@ illegal-instruction exception. Each site is rewritten once, in the running proce
+   SHA256MSG2) are not rewritten: sha_apply performs one on register values the debugger reads from
+   the stopped thread, at every hit. That is a debugger round trip per instruction.
+ 
+-Limits: xmm0-7 only for the SSE4a forms (no REX prefix); the register forms of INSERTQ and EXTRQ
++Limits: the register forms of INSERTQ and EXTRQ
+ (0F 79) are not handled; bits 127:64 of an SSE4a destination, undefined after the original
+ instruction, keep their value. A thread that is inside the overwritten bytes of a jump site while
+ another thread faults on it is not accounted for.
+@@ -137,32 +137,49 @@ def rdpid_stub(code):
+     return at + 3, stub + b"\x5a\x59\x58"                                 # pop rdx; pop rcx; pop rax
+ 
+ 
++def _sse4a_rex(code):
++    """The REX byte between the SSE4a prefix and 0F 78 (0 when there is none)."""
++    return code[1] if len(code) > 1 and 0x40 <= code[1] <= 0x4F else 0
++
++
++def _movq_from_xmm(gpr, xmm):
++    """movq r64, xmm (66 REX.W[R] 0F 7E /r) for rax, rcx or rdx and xmm0-15."""
++    return bytes([0x66, 0x4C if xmm & 8 else 0x48, 0x0F, 0x7E, 0xC0 | (xmm & 7) << 3 | gpr])
++
++
+ def sse4a_stub(code):
+-    """Stub for the immediate INSERTQ or EXTRQ at the start of code (6 bytes), or None."""
+-    if len(code) < 6 or code[1:3] != b"\x0f\x78" or code[0] not in (0xF2, 0x66) or code[3] < 0xC0:
++    """Stub for the immediate INSERTQ or EXTRQ at the start of code, or None.
++
++    F2/66 [REX] 0F 78 /r ib ib: 6 bytes, or 7 with a REX prefix, whose R and B bits extend
++    ModRM.reg and ModRM.rm to xmm8-15 (REX.W and REX.X change nothing here)."""
++    rex = _sse4a_rex(code)
++    at = 2 if rex else 1
++    if len(code) < at + 5 or code[at:at + 2] != b"\x0f\x78" or code[0] not in (0xF2, 0x66) or code[at + 2] < 0xC0:
+         return None
+-    width, offset = (code[4] & 63) or 64, code[5] & 63
++    modrm = code[at + 2]
++    reg, rm = (modrm >> 3) & 7 | (8 if rex & 4 else 0), modrm & 7 | (8 if rex & 1 else 0)
++    width, offset = (code[at + 3] & 63) or 64, code[at + 4] & 63
+     if offset + width > 64:
+         return None  # undefined result on the processor
+     mask = (1 << width) - 1
+     if code[0] == 0xF2:
+-        dest, src = (code[3] >> 3) & 7, code[3] & 7
+-        body = (bytes([0x66, 0x48, 0x0F, 0x7E, 0xC0 | src << 3]) +                       # movq rax, xmm_src
++        dest, src = reg, rm
++        body = (_movq_from_xmm(0, src) +                                                 # movq rax, xmm_src
+                 b"\x48\xb9" + struct.pack("<Q", mask) + b"\x48\x21\xc8" +                # and rax, mask
+                 (bytes([0x48, 0xC1, 0xE0, offset]) if offset else b"") +                 # shl rax, offset
+-                bytes([0x66, 0x48, 0x0F, 0x7E, 0xC0 | dest << 3 | 2]) +                  # movq rdx, xmm_dest
++                _movq_from_xmm(2, dest) +                                                # movq rdx, xmm_dest
+                 b"\x48\xb9" + struct.pack("<Q", ~(mask << offset) & (1 << 64) - 1) + b"\x48\x21\xca" +
+                 b"\x48\x09\xc2")                                                         # or rdx, rax
+     else:
+-        if (code[3] >> 3) & 7:
+-            return None
+-        dest = code[3] & 7
+-        body = (bytes([0x66, 0x48, 0x0F, 0x7E, 0xC0 | dest << 3 | 2]) +                  # movq rdx, xmm_dest
++        if reg:
++            return None  # EXTRQ is /0
++        dest = rm
++        body = (_movq_from_xmm(2, dest) +                                                # movq rdx, xmm_dest
+                 (bytes([0x48, 0xC1, 0xEA, offset]) if offset else b"") +                 # shr rdx, offset
+                 b"\x48\xb9" + struct.pack("<Q", mask) + b"\x48\x21\xca")                 # and rdx, mask
+     # pushfq; push rax; push rcx; push rdx ... pinsrq xmm_dest, rdx, 0; pop rdx; pop rcx; pop rax; popfq
+-    return (b"\x9c\x50\x51\x52" + body + bytes([0x66, 0x48, 0x0F, 0x3A, 0x22, 0xC0 | dest << 3 | 2, 0x00]) +
+-            b"\x5a\x59\x58\x9d")
++    pinsrq = bytes([0x66, 0x4C if dest & 8 else 0x48, 0x0F, 0x3A, 0x22, 0xC0 | (dest & 7) << 3 | 2, 0x00])
++    return b"\x9c\x50\x51\x52" + body + pinsrq + b"\x5a\x59\x58\x9d"
+ 
+ 
+ def stub_for(code):
+@@ -173,7 +190,7 @@ def stub_for(code):
+     if rdpid:
+         return rdpid
+     stub = sse4a_stub(code)
+-    return (6, stub) if stub else None
++    return (7 if _sse4a_rex(code) else 6, stub) if stub else None
+ 
+ 
+ def plan_replacement(code, site, length, stub, stub_address):
+-- 
+2.47.1
+

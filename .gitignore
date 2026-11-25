@@ -1,0 +1,32 @@
+# Anything made from game files stays local: each contributor generates it from their own copy.
+*.exe
+*.dll
+*.rpf
+*.ttpf
+*.xvd
+*.dxbc
+*.fssm
+*.spv
+*.metallib
+carved/
+harness_work/
+data/
+pack/
+upstream/
+
+# Generated results that name shaders or hold translated code
+*.jsonl
+tools/harness/triage/*.json
+tools/harness/triage/summary.txt
+tools/metal_semantic/cache/
+tools/metal_semantic/runs/
+
+# Build products
+tools/harness/harness
+tools/harness/harness_tex
+tools/harness/harness_*
+!tools/harness/harness_tex.swift
+tools/metal_semantic/metal_runner
+__pycache__/
+*.pyc
+.DS_Store
